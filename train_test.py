@@ -1,5 +1,8 @@
 import sys
+from numpy.random import randint
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf
+from pyspark.sql.types import IntegerType
 from pyspark.ml.feature import StringIndexer
 from pyspark.ml.feature import OneHotEncoderEstimator
 from pyspark.ml.feature import VectorAssembler
@@ -14,7 +17,6 @@ if len(sys.argv) != 2:
 input_file_path = sys.argv[1]
 
 # DataFrameの作成
-from pyspark.sql import SparkSession
 spark = SparkSession.builder.appName('criteo').config('spark.some.config.option', 'some-value').getOrCreate()
 df = spark.read.csv(input_file_path, encoding='utf-8', inferSchema=True, sep='\t')
 
@@ -30,12 +32,26 @@ df = df.fillna({feature:'NULL' for feature in category_features})
 # 学習・テストデータに分割
 train, test = df.randomSplit([0.8, 0.2], seed=42)
 
+# ダウンサンプリング
+ratio = 1.0
+counts = train.select(f'_c{label_idx}').groupBy(f'_c{label_idx}').count().collect()
+higher_bound = counts[1][1]
+treshold = int(ratio * float(counts[0][1]) / counts[1][1] * higher_bound)
+
+rand_gen = lambda x: randint(0, higher_bound) if x == 0 else -1
+udf_rand_gen = udf(rand_gen, IntegerType())
+train = train.withColumn('rand_idx', udf_rand_gen('_c0'))
+train_subsample = train.filter(train['rand_idx'] < treshold)
+train_subsample = train_subsample.drop('rand_idx')
+
+train_subsample.select(f'_c{label_idx}').groupBy(f'_c{label_idx}').count().show(n=5)
+
 # パイプラインの構築
 indexers = [StringIndexer(inputCol=feature, outputCol=f'{feature}_idx',  handleInvalid='keep') for feature in category_features]
 encoder = OneHotEncoderEstimator(inputCols=[f'{feature}_idx' for feature in category_features], outputCols=[f'{feature}_vec' for feature in category_features], dropLast=False, handleInvalid='keep')
 assembler = VectorAssembler(inputCols=real_features+[f'{feature}_vec' for feature in category_features], outputCol='assembles')
-pca = PCA(k=100, inputCol='assembles', outputCol='features')
-lr = LogisticRegression(featuresCol='features', labelCol=f'_c{label_idx}', maxIter=100)
+pca = PCA(k=2, inputCol='assembles', outputCol='features')
+lr = LogisticRegression(featuresCol='features', labelCol=f'_c{label_idx}')
 stages = indexers
 stages.append(encoder)
 stages.append(assembler)
@@ -43,7 +59,7 @@ stages.append(pca)
 stages.append(lr)
 pipeline = Pipeline(stages=stages)
 
-model = pipeline.fit(train)
+model = pipeline.fit(train_subsample)
 print(model.stages[-1].coefficients)
 
 predictions = model.transform(test)
